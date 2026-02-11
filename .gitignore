@@ -1,0 +1,5 @@
+# Helper scripts
+tools/
+
+# macOS
+.DS_Store

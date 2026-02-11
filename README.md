@@ -27,6 +27,16 @@ The Matrix screensaver activates after 5 minutes of no touchscreen interaction. 
 
 Routine status refreshes where all statuses remain unchanged will **not** interrupt the screensaver.
 
+### Screensaver Colors
+
+The matrix code color reflects the overall GitHub status in real-time:
+
+- **Green** — All components operational
+- **Orange** — Any component has degraded performance or partial outage
+- **Red** — Any component has a major outage
+
+The color transitions live while the screensaver is running — new trails render in the updated color while existing trails fade out naturally.
+
 ## Configuration
 
 Before uploading, edit the following constants at the top of `Tab5GitHubStatus.ino`:

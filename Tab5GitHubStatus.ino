@@ -71,6 +71,38 @@ unsigned long lastFrameTime   = 0;
 bool screensaverActive = false;
 bool allOperational    = true;      // Tracks if all components are healthy
 
+// Matrix color based on overall status (RGB components for trail rendering)
+// 0=all operational (green), 1=degraded/partial (orange), 2=major outage (red)
+uint8_t matrixSeverity = 0;
+
+// Returns RGB components for the matrix trail based on current severity
+static void matrixTrailColor(int distFromHead, int trailLen, uint8_t& r, uint8_t& g, uint8_t& b) {
+    float brightness;
+    if (distFromHead <= 2) {
+        brightness = 1.0f - (distFromHead * 0.15f);
+    } else {
+        brightness = max(0.08f, (float)(trailLen - distFromHead) / (float)trailLen);
+    }
+
+    switch (matrixSeverity) {
+        case 2:  // Major outage — red
+            r = (uint8_t)(255 * brightness);
+            g = (uint8_t)(40 * brightness);
+            b = (uint8_t)(30 * brightness);
+            break;
+        case 1:  // Degraded/partial — orange
+            r = (uint8_t)(255 * brightness);
+            g = (uint8_t)(150 * brightness);
+            b = 0;
+            break;
+        default: // All operational — green
+            r = 0;
+            g = (uint8_t)(255 * brightness);
+            b = 0;
+            break;
+    }
+}
+
 // ── Previous status tracking (to detect changes) ────────────────────────────
 char prevStatus[MAX_COMPONENTS][32];  // Stores last-known status per component
 
@@ -205,15 +237,17 @@ static void matrixDrawFrame() {
                     matrixChars[i][row] = randomMatrixChar();
                     matrixColors[i][row] = 0xFFFF;
                 } else if (distFromHead <= 2) {
-                    // Near head — bright green, occasionally change char
+                    // Near head — bright, occasionally change char
                     if (random(4) == 0) matrixChars[i][row] = randomMatrixChar();
-                    uint8_t g = 255 - (distFromHead * 40);
-                    matrixColors[i][row] = colSprite->color565(0, g, 0);
+                    uint8_t r, g, b;
+                    matrixTrailColor(distFromHead, col.length, r, g, b);
+                    matrixColors[i][row] = colSprite->color565(r, g, b);
                 } else {
-                    // Trail — dimming green
+                    // Trail — dimming
                     if (random(8) == 0) matrixChars[i][row] = randomMatrixChar();
-                    uint8_t g = max((int)20, 180 - distFromHead * 8);
-                    matrixColors[i][row] = colSprite->color565(0, g, 0);
+                    uint8_t r, g, b;
+                    matrixTrailColor(distFromHead, col.length, r, g, b);
+                    matrixColors[i][row] = colSprite->color565(r, g, b);
                 }
             } else {
                 // Fade existing characters toward black
@@ -314,6 +348,7 @@ static void fetchGitHubStatus() {
             int idx = 0;
             bool nowAllOperational = true;
             bool statusChanged = false;
+            uint8_t worstSeverity = 0;
 
             for (JsonObject comp : components) {
                 if (idx >= MAX_COMPONENTS) break;
@@ -334,7 +369,14 @@ static void fetchGitHubStatus() {
                 }
 
                 // Track if any component is NOT operational
-                if (strcmp(status, "operational") != 0) {
+                if (strcmp(status, "major_outage") == 0) {
+                    nowAllOperational = false;
+                    worstSeverity = 2;
+                } else if (strcmp(status, "degraded_performance") == 0 ||
+                           strcmp(status, "partial_outage") == 0) {
+                    nowAllOperational = false;
+                    if (worstSeverity < 1) worstSeverity = 1;
+                } else if (strcmp(status, "operational") != 0) {
                     nowAllOperational = false;
                 }
 
@@ -346,6 +388,7 @@ static void fetchGitHubStatus() {
                 matrixStopScreensaver();
             }
             allOperational = nowAllOperational;
+            matrixSeverity = worstSeverity;
 
             // Only update UI widget labels when not in screensaver
             // (avoids dirty redraws flashing over the matrix animation)

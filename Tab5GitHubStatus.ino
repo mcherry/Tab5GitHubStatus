@@ -32,7 +32,8 @@ const long GMT_OFFSET_SEC      = -6 * 3600;   // EST = UTC-5
 const int  DAYLIGHT_OFFSET_SEC = 3600;         // +1h for EDT
 
 // ── GitHub Status API ───────────────────────────────────────────────────────
-const char* API_URL = "https://www.githubstatus.com/api/v2/components.json";
+const char* API_URL       = "https://www.githubstatus.com/api/v2/components.json";
+const char* INCIDENTS_URL = "https://www.githubstatus.com/api/v2/incidents/unresolved.json";
 
 // ── Refresh interval: 2 minutes ─────────────────────────────────────────────
 const unsigned long REFRESH_INTERVAL = 120000;
@@ -70,6 +71,7 @@ unsigned long lastFrameTime   = 0;
 // ── Screensaver State ───────────────────────────────────────────────────────
 bool screensaverActive = false;
 bool allOperational    = true;      // Tracks if all components are healthy
+bool hasUnresolvedIncidents = false; // Tracks unresolved incidents
 
 // Matrix color based on overall status (RGB components for trail rendering)
 // 0=all operational (green), 1=degraded/partial (orange), 2=major outage (red)
@@ -150,7 +152,7 @@ static void matrixInit() {
     int numCols = screenW / MATRIX_CHAR_W;
     for (int i = 0; i < numCols && i < MATRIX_MAX_COLS; i++) {
         matrixCols[i].headY      = -(random(screenH));
-        matrixCols[i].speed      = random(7, 16);
+        matrixCols[i].speed      = random(10, 20);
         matrixCols[i].length     = random(8, 24);
         matrixCols[i].active     = true;
         matrixCols[i].spawnDelay = 0;
@@ -185,6 +187,13 @@ static void matrixStopScreensaver() {
         colSprite = nullptr;
     }
 
+    // Restore deferred UI state that was skipped during screensaver
+    if (hasUnresolvedIncidents) {
+        titleBar.setRightText("Disruption with some services");
+    } else {
+        titleBar.setRightText("");
+    }
+
     display.setFont(&fonts::DejaVu18);
     ui.clearScreen();
     ui.drawAll();
@@ -207,7 +216,7 @@ static void matrixDrawFrame() {
                 col.spawnDelay--;
             } else {
                 col.headY      = -(random(MATRIX_CHAR_H * 4));
-                col.speed      = random(7, 16);
+                col.speed      = random(10, 20);
                 col.length     = random(8, 24);
                 col.active     = true;
             }
@@ -304,6 +313,51 @@ static const char* statusIconChar(const char* s) {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
+//  Check for unresolved incidents
+// ═════════════════════════════════════════════════════════════════════════════
+static void checkUnresolvedIncidents() {
+    if (WiFi.status() != WL_CONNECTED) return;
+
+    WiFiClientSecure client;
+    client.setInsecure();
+
+    HTTPClient http;
+    http.begin(client, INCIDENTS_URL);
+    http.setTimeout(10000);
+
+    int httpCode = http.GET();
+
+    if (httpCode == HTTP_CODE_OK) {
+        String payload = http.getString();
+
+        JsonDocument doc;
+        DeserializationError err = deserializeJson(doc, payload);
+
+        if (!err) {
+            JsonArray incidents = doc["incidents"];
+            bool hadIncidents = hasUnresolvedIncidents;
+            hasUnresolvedIncidents = (incidents.size() > 0);
+
+            // If incident state changed while screensaver is active, exit it
+            if (hadIncidents != hasUnresolvedIncidents && screensaverActive) {
+                matrixStopScreensaver();
+            }
+
+            // Only update title bar text when not in screensaver
+            if (!screensaverActive) {
+                if (hasUnresolvedIncidents) {
+                    titleBar.setRightText("Disruption with some services");
+                } else {
+                    titleBar.setRightText("");
+                }
+            }
+        }
+    }
+
+    http.end();
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 //  Draw subtle grid dividers between cells
 // ═════════════════════════════════════════════════════════════════════════════
 static void drawGridLines() {
@@ -390,6 +444,11 @@ static void fetchGitHubStatus() {
             allOperational = nowAllOperational;
             matrixSeverity = worstSeverity;
 
+            // Factor in unresolved incidents for matrix color
+            if (hasUnresolvedIncidents && matrixSeverity < 1) {
+                matrixSeverity = 1;  // At least orange if incidents exist
+            }
+
             // Only update UI widget labels when not in screensaver
             // (avoids dirty redraws flashing over the matrix animation)
             if (!screensaverActive) {
@@ -437,6 +496,14 @@ static void fetchGitHubStatus() {
     }
 
     http.end();
+
+    // ── Check for unresolved incidents ──
+    checkUnresolvedIncidents();
+
+    // Update matrix severity to account for incidents
+    if (hasUnresolvedIncidents && matrixSeverity < 1) {
+        matrixSeverity = 1;
+    }
 
     if (!screensaverActive) {
         ui.drawAll();

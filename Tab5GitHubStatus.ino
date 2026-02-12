@@ -20,6 +20,7 @@
 #include <ArduinoJson.h>
 #include <time.h>
 #include "Tab5UI.h"
+#include "matrix_glyphs.h"
 
 // ── WiFi Configuration ──────────────────────────────────────────────────────
 // Replace with your WiFi credentials
@@ -28,7 +29,7 @@ const char* WIFI_PASS = "WIFIPASSWORD";
 
 // ── Timezone Configuration ───────────────────────────────────────────────────
 // US Eastern: GMT-5, +1h for daylight saving time
-const long GMT_OFFSET_SEC      = -6 * 3600;   // CST = UTC-5
+const long GMT_OFFSET_SEC      = -6 * 3600;   // CST = UTC-6
 const int  DAYLIGHT_OFFSET_SEC = 3600;         // +1h for CDT
 
 // ── GitHub Status API ───────────────────────────────────────────────────────
@@ -40,7 +41,7 @@ const unsigned long REFRESH_INTERVAL = 120000;
 
 // ── Screensaver: triggers after 5 minutes of no touch ───────────────────────
 const unsigned long SCREENSAVER_TIMEOUT = 300000;   // 5 minutes
-const unsigned long MATRIX_FRAME_MS     = 50;       // ~20 fps
+const unsigned long MATRIX_FRAME_MS     = 33;       // ~30 fps
 
 // ── Display & UI ────────────────────────────────────────────────────────────
 M5GFX      display;
@@ -157,53 +158,61 @@ struct MatrixColumn {
 MatrixColumn matrixCols[MATRIX_MAX_COLS];
 
 // ── Matrix Character Set ────────────────────────────────────────────────────
-static const char MATRIX_CHARS[] =
-    "abcdefghijklmnopqrstuvwxyz"
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-    "0123456789"
-    "@#$%&*+=<>?/|{}[]~^";
-static const int MATRIX_CHARS_LEN = sizeof(MATRIX_CHARS) - 1;
+static uint8_t randomGlyphIndex() {
+    return (uint8_t)random(MGLYPH_COUNT);
+}
 
-static char randomMatrixChar() {
-    return MATRIX_CHARS[random(MATRIX_CHARS_LEN)];
+// Draw a 1-bit glyph into a sprite at (dx, dy) with the given RGB565 color.
+// The glyph is centered within a MATRIX_CHAR_W x MATRIX_CHAR_H cell.
+static void drawGlyph(LGFX_Sprite* spr, int16_t dx, int16_t dy, uint8_t idx, uint16_t color) {
+    if (idx >= MGLYPH_COUNT) return;
+    const uint8_t* glyph = matrixGlyphs[idx];
+    // Center the 16x24 glyph in the 22x30 cell
+    int16_t offX = (MATRIX_CHAR_W - MGLYPH_W) / 2;
+    int16_t offY = (MATRIX_CHAR_H - MGLYPH_H) / 2;
+    for (int gy = 0; gy < MGLYPH_H; gy++) {
+        uint8_t b0 = pgm_read_byte(&glyph[gy * MGLYPH_BYTES_PER_ROW]);
+        uint8_t b1 = pgm_read_byte(&glyph[gy * MGLYPH_BYTES_PER_ROW + 1]);
+        uint16_t rowBits = ((uint16_t)b0 << 8) | b1;
+        if (rowBits == 0) continue;  // Skip empty rows
+        for (int gx = 0; gx < MGLYPH_W; gx++) {
+            if (rowBits & (0x8000 >> gx)) {
+                spr->drawPixel(dx + offX + gx, dy + offY + gy, color);
+            }
+        }
+    }
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-//  Matrix Screensaver Functions (column-strip sprite for smooth rendering)
+//  Matrix Screensaver Functions (column-strip sprite rendering)
 // ═════════════════════════════════════════════════════════════════════════════
-// Instead of a full-screen sprite (~1.8MB), we use a single column-wide
-// sprite that is reused for each column.  This keeps memory usage tiny
-// while still providing flicker-free per-column rendering.
 static LGFX_Sprite* colSprite = nullptr;
 
-// Per-column character buffer so trails persist across frames
+// Per-column glyph buffer so trails persist across frames
 #define MATRIX_ROWS_MAX (720 / MATRIX_CHAR_H + 2)
-static char   matrixChars[MATRIX_MAX_COLS][MATRIX_ROWS_MAX];
+static uint8_t  matrixGlyphIdx[MATRIX_MAX_COLS][MATRIX_ROWS_MAX];
 static uint16_t matrixColors[MATRIX_MAX_COLS][MATRIX_ROWS_MAX];
 
 static void matrixInit() {
     int numCols = screenW / MATRIX_CHAR_W;
     for (int i = 0; i < numCols && i < MATRIX_MAX_COLS; i++) {
         matrixCols[i].headY      = -(random(screenH));
-        matrixCols[i].speed      = random(10, 20);
+        matrixCols[i].speed      = random(14, 26);
         matrixCols[i].length     = random(8, 24);
         matrixCols[i].active     = true;
         matrixCols[i].spawnDelay = 0;
     }
-    // Initialize character grid
-    memset(matrixChars, 0, sizeof(matrixChars));
+    memset(matrixGlyphIdx, 0, sizeof(matrixGlyphIdx));
     memset(matrixColors, 0, sizeof(matrixColors));
 }
 
 static void matrixStartScreensaver() {
     screensaverActive = true;
 
-    // Create a single column-wide sprite (reused for each column)
     if (!colSprite) {
         colSprite = new LGFX_Sprite(&display);
         colSprite->setColorDepth(16);
         colSprite->createSprite(MATRIX_CHAR_W, screenH);
-        colSprite->setFont(&fonts::DejaVu24);
     }
 
     display.fillScreen(0x000000);
@@ -237,22 +246,19 @@ static void matrixDrawFrame() {
     int numCols = screenW / MATRIX_CHAR_W;
     int numRows = screenH / MATRIX_CHAR_H;
 
+    // Update all column state
     for (int i = 0; i < numCols && i < MATRIX_MAX_COLS; i++) {
         MatrixColumn& col = matrixCols[i];
-
-        // Respawn logic for inactive columns
         if (!col.active) {
             if (col.spawnDelay > 0) {
                 col.spawnDelay--;
             } else {
                 col.headY      = -(random(MATRIX_CHAR_H * 4));
-                col.speed      = random(10, 20);
+                col.speed      = random(14, 26);
                 col.length     = random(8, 24);
                 col.active     = true;
             }
         }
-
-        // Advance the column
         if (col.active) {
             col.headY += col.speed;
             if (col.headY - col.length * MATRIX_CHAR_H > screenH) {
@@ -260,36 +266,35 @@ static void matrixDrawFrame() {
                 col.spawnDelay = random(5, 40);
             }
         }
+    }
 
-        // ── Render this column into the strip sprite ──
+    // Render each column into the strip sprite and push
+    for (int i = 0; i < numCols && i < MATRIX_MAX_COLS; i++) {
+        MatrixColumn& col = matrixCols[i];
         int16_t x = i * MATRIX_CHAR_W;
-        colSprite->fillScreen(0x0000);   // Black background
+
+        colSprite->fillScreen(0x0000);
 
         for (int row = 0; row < numRows; row++) {
             int16_t charY = row * MATRIX_CHAR_H;
             int distFromHead = (col.headY - charY) / MATRIX_CHAR_H;
 
             if (col.active && distFromHead >= 0 && distFromHead < col.length) {
-                // This cell is within the active trail
                 if (distFromHead == 0) {
-                    // Head — white, new character
-                    matrixChars[i][row] = randomMatrixChar();
+                    matrixGlyphIdx[i][row] = randomGlyphIndex();
                     matrixColors[i][row] = 0xFFFF;
                 } else if (distFromHead <= 2) {
-                    // Near head — bright, occasionally change char
-                    if (random(4) == 0) matrixChars[i][row] = randomMatrixChar();
+                    if (random(4) == 0) matrixGlyphIdx[i][row] = randomGlyphIndex();
                     uint8_t r, g, b;
                     matrixTrailColor(distFromHead, col.length, r, g, b);
                     matrixColors[i][row] = colSprite->color565(r, g, b);
                 } else {
-                    // Trail — dimming
-                    if (random(8) == 0) matrixChars[i][row] = randomMatrixChar();
+                    if (random(8) == 0) matrixGlyphIdx[i][row] = randomGlyphIndex();
                     uint8_t r, g, b;
                     matrixTrailColor(distFromHead, col.length, r, g, b);
                     matrixColors[i][row] = colSprite->color565(r, g, b);
                 }
             } else {
-                // Fade existing characters toward black
                 if (matrixColors[i][row] != 0) {
                     uint16_t c = matrixColors[i][row];
                     uint16_t r = (c >> 11) & 0x1F;
@@ -302,15 +307,11 @@ static void matrixDrawFrame() {
                 }
             }
 
-            // Draw the character if it has color
-            if (matrixColors[i][row] != 0 && matrixChars[i][row] != 0) {
-                char ch[2] = { matrixChars[i][row], '\0' };
-                colSprite->setTextColor(matrixColors[i][row]);
-                colSprite->drawString(ch, 0, charY);
+            if (matrixColors[i][row] != 0) {
+                drawGlyph(colSprite, 0, charY, matrixGlyphIdx[i][row], matrixColors[i][row]);
             }
         }
 
-        // Push this column strip to the display
         colSprite->pushSprite(x, 0);
     }
 }

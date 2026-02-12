@@ -28,8 +28,8 @@ const char* WIFI_PASS = "WIFIPASSWORD";
 
 // ── Timezone Configuration ───────────────────────────────────────────────────
 // US Eastern: GMT-5, +1h for daylight saving time
-const long GMT_OFFSET_SEC      = -6 * 3600;   // EST = UTC-5
-const int  DAYLIGHT_OFFSET_SEC = 3600;         // +1h for EDT
+const long GMT_OFFSET_SEC      = -6 * 3600;   // CST = UTC-6
+const int  DAYLIGHT_OFFSET_SEC = 3600;         // +1h for CDT
 
 // ── GitHub Status API ───────────────────────────────────────────────────────
 const char* API_URL       = "https://www.githubstatus.com/api/v2/components.json";
@@ -63,6 +63,13 @@ UILabel*      nameLabels[MAX_COMPONENTS];
 UILabel*      statusLabels[MAX_COMPONENTS];
 UIIconCircle* statusIcons[MAX_COMPONENTS];
 
+// Status banner between title bar and grid
+#define BANNER_H  36
+UILabel       statusBanner(0, TAB5_TITLE_H, 1280, BANNER_H,
+                           "All Systems Operational",
+                           Tab5Theme::TEXT_PRIMARY,
+                           TAB5_FONT_SIZE_MD);
+
 // ── Timing ──────────────────────────────────────────────────────────────────
 unsigned long lastRefreshTime = 0;
 unsigned long lastTouchTime   = 0;
@@ -72,6 +79,9 @@ unsigned long lastFrameTime   = 0;
 bool screensaverActive = false;
 bool allOperational    = true;      // Tracks if all components are healthy
 bool hasUnresolvedIncidents = false; // Tracks unresolved incidents
+
+// Cached status bar text (applied when screensaver exits)
+char cachedStatusText[48] = "";
 
 // Matrix color based on overall status (RGB components for trail rendering)
 // 0=all operational (green), 1=degraded/partial (orange), 2=major outage (red)
@@ -188,11 +198,8 @@ static void matrixStopScreensaver() {
     }
 
     // Restore deferred UI state that was skipped during screensaver
-    if (hasUnresolvedIncidents) {
-        titleBar.setRightText("Disruption with some services");
-    } else {
-        titleBar.setRightText("");
-    }
+    updateStatusBanner();
+    statusBar.setRightText(cachedStatusText);
 
     display.setFont(&fonts::DejaVu18);
     ui.clearScreen();
@@ -286,6 +293,22 @@ static void matrixDrawFrame() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
+//  Update status banner based on current state
+// ═════════════════════════════════════════════════════════════════════════════
+static void updateStatusBanner() {
+    if (allOperational && !hasUnresolvedIncidents) {
+        statusBanner.setText("All Systems Operational");
+        statusBanner.setBgColor(Tab5Theme::SECONDARY);     // Green
+    } else if (matrixSeverity >= 2) {
+        statusBanner.setText("Disruption with some GitHub services");
+        statusBanner.setBgColor(Tab5Theme::DANGER);         // Red
+    } else {
+        statusBanner.setText("Disruption with some GitHub services");
+        statusBanner.setBgColor(Tab5Theme::ACCENT);         // Orange
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 //  Status → color / display text / icon character
 // ═════════════════════════════════════════════════════════════════════════════
 static uint32_t statusColor(const char* s) {
@@ -343,13 +366,9 @@ static void checkUnresolvedIncidents() {
                 matrixStopScreensaver();
             }
 
-            // Only update title bar text when not in screensaver
+            // Only update banner when not in screensaver
             if (!screensaverActive) {
-                if (hasUnresolvedIncidents) {
-                    titleBar.setRightText("Disruption with some services");
-                } else {
-                    titleBar.setRightText("");
-                }
+                updateStatusBanner();
             }
         }
     }
@@ -374,8 +393,9 @@ static void drawGridLines() {
 static void fetchGitHubStatus() {
     // Reconnect WiFi if needed
     if (WiFi.status() != WL_CONNECTED) {
-        statusBar.setRightText("WiFi disconnected");
+        strncpy(cachedStatusText, "WiFi disconnected", sizeof(cachedStatusText));
         if (!screensaverActive) {
+            statusBar.setRightText(cachedStatusText);
             ui.drawAll();
             drawGridLines();
         }
@@ -473,25 +493,35 @@ static void fetchGitHubStatus() {
 
                     idx2++;
                 }
+
+                // Update the status banner
+                updateStatusBanner();
             }
 
             // Show last-updated time in the status bar
             struct tm ti;
             if (getLocalTime(&ti, 1000)) {
-                char buf[48];
-                strftime(buf, sizeof(buf), "Updated: %H:%M:%S", &ti);
-                statusBar.setRightText(buf);
+                strftime(cachedStatusText, sizeof(cachedStatusText), "Updated: %H:%M:%S", &ti);
             } else {
-                statusBar.setRightText("Updated");
+                strncpy(cachedStatusText, "Updated", sizeof(cachedStatusText));
+            }
+            if (!screensaverActive) {
+                statusBar.setRightText(cachedStatusText);
             }
         } else {
-            statusBar.setRightText("JSON parse error");
+            strncpy(cachedStatusText, "JSON parse error", sizeof(cachedStatusText));
+            if (!screensaverActive) {
+                statusBar.setRightText(cachedStatusText);
+            }
             Serial.printf("deserializeJson: %s\n", err.c_str());
         }
     } else {
         char buf[48];
         snprintf(buf, sizeof(buf), "HTTP error: %d", httpCode);
-        statusBar.setRightText(buf);
+        strncpy(cachedStatusText, buf, sizeof(cachedStatusText));
+        if (!screensaverActive) {
+            statusBar.setRightText(cachedStatusText);
+        }
         Serial.printf("HTTP GET failed: %d\n", httpCode);
     }
 
@@ -527,8 +557,8 @@ void setup() {
     screenW = Tab5UI::screenW();
     screenH = Tab5UI::screenH();
 
-    // ── Grid geometry ──
-    contentTop    = TAB5_TITLE_H;
+    // ── Grid geometry (account for banner below title bar) ──
+    contentTop    = TAB5_TITLE_H + BANNER_H;
     contentBottom = screenH - TAB5_STATUS_H;
     contentH      = contentBottom - contentTop;
     colW          = screenW / GRID_COLS;
@@ -536,6 +566,13 @@ void setup() {
 
     // ── Title bar — left-aligned title ──
     titleBar.setLeftText("GitHub Status");
+
+    // ── Status banner — centered, full width ──
+    statusBanner.setPosition(0, TAB5_TITLE_H);
+    statusBanner.setSize(screenW, BANNER_H);
+    statusBanner.setAlign(textdatum_t::middle_center);
+    statusBanner.setBgColor(Tab5Theme::SECONDARY);
+    statusBanner.setTextColor(Tab5Theme::TEXT_PRIMARY);
 
     // ── Status bar — right-aligned update time ──
     statusBar.setRightText("Starting...");
@@ -591,6 +628,7 @@ void setup() {
     ui.clearScreen();
 
     ui.addElement(&titleBar);
+    ui.addElement(&statusBanner);
     for (int i = 0; i < MAX_COMPONENTS; i++) {
         ui.addElement(nameLabels[i]);
         ui.addElement(statusLabels[i]);

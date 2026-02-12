@@ -28,7 +28,7 @@ const char* WIFI_PASS = "WIFIPASSWORD";
 
 // ── Timezone Configuration ───────────────────────────────────────────────────
 // US Eastern: GMT-5, +1h for daylight saving time
-const long GMT_OFFSET_SEC      = -6 * 3600;   // CST = UTC-6
+const long GMT_OFFSET_SEC      = -6 * 3600;   // CST = UTC-5
 const int  DAYLIGHT_OFFSET_SEC = 3600;         // +1h for CDT
 
 // ── GitHub Status API ───────────────────────────────────────────────────────
@@ -71,7 +71,6 @@ UILabel       statusBanner(0, TAB5_TITLE_H, 1280, BANNER_H,
                            TAB5_FONT_SIZE_MD);
 
 // ── Timing ──────────────────────────────────────────────────────────────────
-unsigned long lastRefreshTime = 0;
 unsigned long lastTouchTime   = 0;
 unsigned long lastFrameTime   = 0;
 
@@ -82,6 +81,30 @@ bool hasUnresolvedIncidents = false; // Tracks unresolved incidents
 
 // Cached status bar text (applied when screensaver exits)
 char cachedStatusText[48] = "";
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  Background Fetch — Shared data between Core 0 (fetch) and Core 1 (UI)
+// ═════════════════════════════════════════════════════════════════════════════
+struct ComponentResult {
+    char     name[48];
+    char     status[32];
+};
+
+struct FetchResult {
+    bool              valid;             // Data was fetched successfully
+    bool              statusChanged;     // At least one component status changed
+    bool              allOperational;
+    uint8_t           worstSeverity;
+    bool              hasIncidents;
+    int               componentCount;
+    ComponentResult   components[MAX_COMPONENTS];
+    char              statusBarText[48]; // Formatted update time
+};
+
+static SemaphoreHandle_t fetchMutex = nullptr;
+static FetchResult       fetchResult;       // Written by Core 0, read by Core 1
+static volatile bool     newDataReady = false;
+static TaskHandle_t      fetchTaskHandle = nullptr;
 
 // Matrix color based on overall status (RGB components for trail rendering)
 // 0=all operational (green), 1=degraded/partial (orange), 2=major outage (red)
@@ -336,44 +359,204 @@ static const char* statusIconChar(const char* s) {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-//  Check for unresolved incidents
+//  Background fetch task (runs on Core 0)
 // ═════════════════════════════════════════════════════════════════════════════
-static void checkUnresolvedIncidents() {
-    if (WiFi.status() != WL_CONNECTED) return;
+static void fetchTaskFunc(void* param) {
+    for (;;) {
+        // Wait for the refresh interval
+        vTaskDelay(pdMS_TO_TICKS(REFRESH_INTERVAL));
 
-    WiFiClientSecure client;
-    client.setInsecure();
-
-    HTTPClient http;
-    http.begin(client, INCIDENTS_URL);
-    http.setTimeout(10000);
-
-    int httpCode = http.GET();
-
-    if (httpCode == HTTP_CODE_OK) {
-        String payload = http.getString();
-
-        JsonDocument doc;
-        DeserializationError err = deserializeJson(doc, payload);
-
-        if (!err) {
-            JsonArray incidents = doc["incidents"];
-            bool hadIncidents = hasUnresolvedIncidents;
-            hasUnresolvedIncidents = (incidents.size() > 0);
-
-            // If incident state changed while screensaver is active, exit it
-            if (hadIncidents != hasUnresolvedIncidents && screensaverActive) {
-                matrixStopScreensaver();
+        if (WiFi.status() != WL_CONNECTED) {
+            // Write a WiFi error result
+            if (xSemaphoreTake(fetchMutex, pdMS_TO_TICKS(100))) {
+                fetchResult.valid = false;
+                strncpy(fetchResult.statusBarText, "WiFi disconnected", sizeof(fetchResult.statusBarText));
+                newDataReady = true;
+                xSemaphoreGive(fetchMutex);
             }
+            continue;
+        }
 
-            // Only update banner when not in screensaver
-            if (!screensaverActive) {
-                updateStatusBanner();
+        // ── Local temporaries for building result ──
+        FetchResult res;
+        memset(&res, 0, sizeof(res));
+        res.valid = false;
+        res.allOperational = true;
+        res.worstSeverity = 0;
+        res.hasIncidents = false;
+        res.statusChanged = false;
+
+        // ── Fetch components ──
+        {
+            WiFiClientSecure client;
+            client.setInsecure();
+            HTTPClient http;
+            http.begin(client, API_URL);
+            http.setTimeout(10000);
+            int httpCode = http.GET();
+
+            if (httpCode == HTTP_CODE_OK) {
+                String payload = http.getString();
+                JsonDocument doc;
+                DeserializationError err = deserializeJson(doc, payload);
+
+                if (!err) {
+                    JsonArray components = doc["components"];
+                    int idx = 0;
+
+                    for (JsonObject comp : components) {
+                        if (idx >= MAX_COMPONENTS) break;
+
+                        const char* name   = comp["name"];
+                        const char* status = comp["status"];
+                        bool hidden        = comp["only_show_if_degraded"] | false;
+
+                        if (hidden) continue;
+                        if (name && strncmp(name, "Visit", 5) == 0) continue;
+
+                        strncpy(res.components[idx].name, name, sizeof(res.components[idx].name) - 1);
+                        strncpy(res.components[idx].status, status, sizeof(res.components[idx].status) - 1);
+
+                        // Detect changes against prevStatus (read-only, safe)
+                        if (strcmp(prevStatus[idx], status) != 0) {
+                            res.statusChanged = true;
+                        }
+
+                        if (strcmp(status, "major_outage") == 0) {
+                            res.allOperational = false;
+                            res.worstSeverity = 2;
+                        } else if (strcmp(status, "degraded_performance") == 0 ||
+                                   strcmp(status, "partial_outage") == 0) {
+                            res.allOperational = false;
+                            if (res.worstSeverity < 1) res.worstSeverity = 1;
+                        } else if (strcmp(status, "operational") != 0) {
+                            res.allOperational = false;
+                        }
+
+                        idx++;
+                    }
+                    res.componentCount = idx;
+                    res.valid = true;
+
+                    // Format update time
+                    struct tm ti;
+                    if (getLocalTime(&ti, 1000)) {
+                        strftime(res.statusBarText, sizeof(res.statusBarText), "Updated: %H:%M:%S", &ti);
+                    } else {
+                        strncpy(res.statusBarText, "Updated", sizeof(res.statusBarText));
+                    }
+                } else {
+                    strncpy(res.statusBarText, "JSON parse error", sizeof(res.statusBarText));
+                    Serial.printf("deserializeJson: %s\n", err.c_str());
+                }
+            } else {
+                snprintf(res.statusBarText, sizeof(res.statusBarText), "HTTP error: %d", httpCode);
+                Serial.printf("HTTP GET failed: %d\n", httpCode);
             }
+            http.end();
+        }
+
+        // ── Fetch unresolved incidents ──
+        {
+            WiFiClientSecure client;
+            client.setInsecure();
+            HTTPClient http;
+            http.begin(client, INCIDENTS_URL);
+            http.setTimeout(10000);
+            int httpCode = http.GET();
+
+            if (httpCode == HTTP_CODE_OK) {
+                String payload = http.getString();
+                JsonDocument doc;
+                DeserializationError err = deserializeJson(doc, payload);
+                if (!err) {
+                    JsonArray incidents = doc["incidents"];
+                    res.hasIncidents = (incidents.size() > 0);
+                }
+            }
+            http.end();
+        }
+
+        // Factor incidents into severity
+        if (res.hasIncidents && res.worstSeverity < 1) {
+            res.worstSeverity = 1;
+        }
+
+        // ── Write result to shared struct under mutex ──
+        if (xSemaphoreTake(fetchMutex, pdMS_TO_TICKS(200))) {
+            memcpy(&fetchResult, &res, sizeof(FetchResult));
+            newDataReady = true;
+            xSemaphoreGive(fetchMutex);
+        }
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  Apply fetch results to UI (called on Core 1 in loop)
+// ═════════════════════════════════════════════════════════════════════════════
+static void applyFetchResults() {
+    FetchResult res;
+
+    // Copy result under mutex
+    if (!xSemaphoreTake(fetchMutex, pdMS_TO_TICKS(50))) return;
+    memcpy(&res, &fetchResult, sizeof(FetchResult));
+    newDataReady = false;
+    xSemaphoreGive(fetchMutex);
+
+    // Update cached status text
+    strncpy(cachedStatusText, res.statusBarText, sizeof(cachedStatusText));
+
+    if (!res.valid) {
+        // WiFi disconnected or parse error — just update status bar
+        if (!screensaverActive) {
+            statusBar.setRightText(cachedStatusText);
+            ui.drawAll();
+            drawGridLines();
+        }
+        return;
+    }
+
+    // Update prevStatus and detect changes
+    bool statusChanged = false;
+    for (int i = 0; i < res.componentCount; i++) {
+        if (strcmp(prevStatus[i], res.components[i].status) != 0) {
+            statusChanged = true;
+            strncpy(prevStatus[i], res.components[i].status, sizeof(prevStatus[i]) - 1);
+            prevStatus[i][sizeof(prevStatus[i]) - 1] = '\0';
         }
     }
 
-    http.end();
+    // Check if incident state changed
+    bool incidentChanged = (hasUnresolvedIncidents != res.hasIncidents);
+
+    // Update global state
+    allOperational = res.allOperational;
+    hasUnresolvedIncidents = res.hasIncidents;
+    matrixSeverity = res.worstSeverity;
+
+    // If status or incidents changed, exit screensaver
+    if ((statusChanged || incidentChanged) && screensaverActive) {
+        matrixStopScreensaver();
+    }
+
+    // Update UI widgets only when screensaver is not active
+    if (!screensaverActive) {
+        for (int i = 0; i < res.componentCount; i++) {
+            uint32_t color = statusColor(res.components[i].status);
+
+            nameLabels[i]->setText(res.components[i].name);
+            statusLabels[i]->setText(statusDisplayText(res.components[i].status));
+            statusLabels[i]->setTextColor(color);
+            statusIcons[i]->setFillColor(color);
+            statusIcons[i]->setBorderColor(color);
+            statusIcons[i]->setIconChar(statusIconChar(res.components[i].status));
+        }
+
+        updateStatusBanner();
+        statusBar.setRightText(cachedStatusText);
+        ui.drawAll();
+        drawGridLines();
+    }
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -388,157 +571,101 @@ static void drawGridLines() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-//  Fetch status from GitHub API and update the UI
+//  Initial synchronous fetch (used once in setup before task starts)
 // ═════════════════════════════════════════════════════════════════════════════
-static void fetchGitHubStatus() {
-    // Reconnect WiFi if needed
+static void fetchGitHubStatusSync() {
     if (WiFi.status() != WL_CONNECTED) {
-        strncpy(cachedStatusText, "WiFi disconnected", sizeof(cachedStatusText));
-        if (!screensaverActive) {
-            statusBar.setRightText(cachedStatusText);
-            ui.drawAll();
-            drawGridLines();
-        }
+        statusBar.setRightText("WiFi disconnected");
+        ui.drawAll();
+        drawGridLines();
         return;
     }
 
-    WiFiClientSecure client;
-    client.setInsecure();                       // Skip certificate verification
+    // Fetch components
+    {
+        WiFiClientSecure client;
+        client.setInsecure();
+        HTTPClient http;
+        http.begin(client, API_URL);
+        http.setTimeout(10000);
+        int httpCode = http.GET();
 
-    HTTPClient http;
-    http.begin(client, API_URL);
-    http.setTimeout(10000);
+        if (httpCode == HTTP_CODE_OK) {
+            String payload = http.getString();
+            JsonDocument doc;
+            DeserializationError err = deserializeJson(doc, payload);
 
-    int httpCode = http.GET();
+            if (!err) {
+                JsonArray components = doc["components"];
+                int idx = 0;
+                uint8_t worstSeverity = 0;
 
-    if (httpCode == HTTP_CODE_OK) {
-        String payload = http.getString();
-
-        JsonDocument doc;
-        DeserializationError err = deserializeJson(doc, payload);
-
-        if (!err) {
-            JsonArray components = doc["components"];
-            int idx = 0;
-            bool nowAllOperational = true;
-            bool statusChanged = false;
-            uint8_t worstSeverity = 0;
-
-            for (JsonObject comp : components) {
-                if (idx >= MAX_COMPONENTS) break;
-
-                const char* name   = comp["name"];
-                const char* status = comp["status"];
-                bool hidden        = comp["only_show_if_degraded"] | false;
-
-                // Skip utility / hidden entries
-                if (hidden) continue;
-                if (name && strncmp(name, "Visit", 5) == 0) continue;
-
-                // Detect if this component's status changed from last fetch
-                if (strcmp(prevStatus[idx], status) != 0) {
-                    statusChanged = true;
-                    strncpy(prevStatus[idx], status, sizeof(prevStatus[idx]) - 1);
-                    prevStatus[idx][sizeof(prevStatus[idx]) - 1] = '\0';
-                }
-
-                // Track if any component is NOT operational
-                if (strcmp(status, "major_outage") == 0) {
-                    nowAllOperational = false;
-                    worstSeverity = 2;
-                } else if (strcmp(status, "degraded_performance") == 0 ||
-                           strcmp(status, "partial_outage") == 0) {
-                    nowAllOperational = false;
-                    if (worstSeverity < 1) worstSeverity = 1;
-                } else if (strcmp(status, "operational") != 0) {
-                    nowAllOperational = false;
-                }
-
-                idx++;
-            }
-
-            // If any status changed, exit screensaver to show the update
-            if (statusChanged && screensaverActive) {
-                matrixStopScreensaver();
-            }
-            allOperational = nowAllOperational;
-            matrixSeverity = worstSeverity;
-
-            // Factor in unresolved incidents for matrix color
-            if (hasUnresolvedIncidents && matrixSeverity < 1) {
-                matrixSeverity = 1;  // At least orange if incidents exist
-            }
-
-            // Only update UI widget labels when not in screensaver
-            // (avoids dirty redraws flashing over the matrix animation)
-            if (!screensaverActive) {
-                int idx2 = 0;
                 for (JsonObject comp : components) {
-                    if (idx2 >= MAX_COMPONENTS) break;
-
+                    if (idx >= MAX_COMPONENTS) break;
                     const char* name   = comp["name"];
                     const char* status = comp["status"];
                     bool hidden        = comp["only_show_if_degraded"] | false;
                     if (hidden) continue;
                     if (name && strncmp(name, "Visit", 5) == 0) continue;
 
+                    strncpy(prevStatus[idx], status, sizeof(prevStatus[idx]) - 1);
                     uint32_t color = statusColor(status);
+                    nameLabels[idx]->setText(name);
+                    statusLabels[idx]->setText(statusDisplayText(status));
+                    statusLabels[idx]->setTextColor(color);
+                    statusIcons[idx]->setFillColor(color);
+                    statusIcons[idx]->setBorderColor(color);
+                    statusIcons[idx]->setIconChar(statusIconChar(status));
 
-                    nameLabels[idx2]->setText(name);
-                    statusLabels[idx2]->setText(statusDisplayText(status));
-                    statusLabels[idx2]->setTextColor(color);
-                    statusIcons[idx2]->setFillColor(color);
-                    statusIcons[idx2]->setBorderColor(color);
-                    statusIcons[idx2]->setIconChar(statusIconChar(status));
-
-                    idx2++;
+                    if (strcmp(status, "major_outage") == 0) {
+                        allOperational = false; worstSeverity = 2;
+                    } else if (strcmp(status, "degraded_performance") == 0 ||
+                               strcmp(status, "partial_outage") == 0) {
+                        allOperational = false;
+                        if (worstSeverity < 1) worstSeverity = 1;
+                    } else if (strcmp(status, "operational") != 0) {
+                        allOperational = false;
+                    }
+                    idx++;
                 }
+                matrixSeverity = worstSeverity;
 
-                // Update the status banner
-                updateStatusBanner();
-            }
-
-            // Show last-updated time in the status bar
-            struct tm ti;
-            if (getLocalTime(&ti, 1000)) {
-                strftime(cachedStatusText, sizeof(cachedStatusText), "Updated: %H:%M:%S", &ti);
-            } else {
-                strncpy(cachedStatusText, "Updated", sizeof(cachedStatusText));
-            }
-            if (!screensaverActive) {
+                struct tm ti;
+                if (getLocalTime(&ti, 1000)) {
+                    strftime(cachedStatusText, sizeof(cachedStatusText), "Updated: %H:%M:%S", &ti);
+                } else {
+                    strncpy(cachedStatusText, "Updated", sizeof(cachedStatusText));
+                }
                 statusBar.setRightText(cachedStatusText);
             }
-        } else {
-            strncpy(cachedStatusText, "JSON parse error", sizeof(cachedStatusText));
-            if (!screensaverActive) {
-                statusBar.setRightText(cachedStatusText);
+        }
+        http.end();
+    }
+
+    // Fetch incidents
+    {
+        WiFiClientSecure client;
+        client.setInsecure();
+        HTTPClient http;
+        http.begin(client, INCIDENTS_URL);
+        http.setTimeout(10000);
+        int httpCode = http.GET();
+        if (httpCode == HTTP_CODE_OK) {
+            String payload = http.getString();
+            JsonDocument doc;
+            DeserializationError err = deserializeJson(doc, payload);
+            if (!err) {
+                JsonArray incidents = doc["incidents"];
+                hasUnresolvedIncidents = (incidents.size() > 0);
             }
-            Serial.printf("deserializeJson: %s\n", err.c_str());
         }
-    } else {
-        char buf[48];
-        snprintf(buf, sizeof(buf), "HTTP error: %d", httpCode);
-        strncpy(cachedStatusText, buf, sizeof(cachedStatusText));
-        if (!screensaverActive) {
-            statusBar.setRightText(cachedStatusText);
-        }
-        Serial.printf("HTTP GET failed: %d\n", httpCode);
+        http.end();
     }
 
-    http.end();
-
-    // ── Check for unresolved incidents ──
-    checkUnresolvedIncidents();
-
-    // Update matrix severity to account for incidents
-    if (hasUnresolvedIncidents && matrixSeverity < 1) {
-        matrixSeverity = 1;
-    }
-
-    if (!screensaverActive) {
-        ui.drawAll();
-        drawGridLines();
-    }
+    if (hasUnresolvedIncidents && matrixSeverity < 1) matrixSeverity = 1;
+    updateStatusBanner();
+    ui.drawAll();
+    drawGridLines();
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -672,10 +799,22 @@ void setup() {
     // ── Initialize previous status tracking ──
     memset(prevStatus, 0, sizeof(prevStatus));
 
-    // ── First status fetch ──
-    fetchGitHubStatus();
-    lastRefreshTime = millis();
+    // ── First status fetch (synchronous, before background task starts) ──
+    fetchGitHubStatusSync();
     lastTouchTime   = millis();
+
+    // ── Create mutex and start background fetch task on Core 0 ──
+    fetchMutex = xSemaphoreCreateMutex();
+    xTaskCreatePinnedToCore(
+        fetchTaskFunc,      // Task function
+        "FetchTask",        // Name
+        8192,               // Stack size (bytes)
+        nullptr,            // Parameter
+        1,                  // Priority
+        &fetchTaskHandle,   // Task handle
+        0                   // Core 0
+    );
+    Serial.println("Background fetch task started on Core 0");
 
     // ── Screen sleep after 8 hours of no touch ──
     ui.setSleepTimeout(480);
@@ -690,15 +829,8 @@ void loop() {
     ui.update();
 
     // ── Detect touch for screensaver idle tracking ──
-    // UIManager already consumed the touch, so we check indirectly:
-    // If the screen was asleep and UIManager just woke it, that was a touch.
-    // For normal operation, poll touch separately just for idle detection.
-    // We use a second getTouch call — if UIManager already consumed it,
-    // this returns 0, which is fine (no false positive). If there's a
-    // continued press, both see it.
     {
         lgfx::touch_point_t tp;
-        // Check if display is being touched right now
         auto touchCount = display.getTouch(&tp, 1);
         if (touchCount > 0) {
             lastTouchTime = millis();
@@ -708,10 +840,9 @@ void loop() {
         }
     }
 
-    // ── Refresh GitHub status every 2 minutes (always, even during screensaver) ──
-    if (millis() - lastRefreshTime >= REFRESH_INTERVAL) {
-        fetchGitHubStatus();
-        lastRefreshTime = millis();
+    // ── Check for new data from background fetch task (Core 0) ──
+    if (newDataReady) {
+        applyFetchResults();
     }
 
     // ── Screensaver activation after 5 min idle ──

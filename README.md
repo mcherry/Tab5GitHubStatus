@@ -15,8 +15,20 @@ A real-time GitHub service status dashboard for the **M5Stack Tab5** (1280×720 
 - **Live status grid** — Displays 10 GitHub service components (Git Operations, Webhooks, API Requests, Issues, Pull Requests, Actions, Packages, Pages, Codespaces, Copilot) in a 2×5 grid layout
 - **Color-coded indicators** — Green (Operational), Orange (Degraded/Partial Outage), Red (Major Outage) circle icons with status text
 - **Auto-refresh** — Status updates every **2 minutes** from the [GitHub Status API](https://www.githubstatus.com/api/v2/components.json)
+- **Dual-core architecture** — HTTP fetches and JSON parsing run on Core 0, keeping the UI and screensaver animation stutter-free on Core 1
 - **Matrix screensaver** — A scrolling Matrix-style code rain screensaver activates after **5 minutes** of no touch interaction
 - **Display sleep** — The screen turns off after **8 hours** of inactivity to save power
+
+## Architecture
+
+The sketch takes advantage of the ESP32's dual-core processor:
+
+| Core | Responsibility |
+|---|---|
+| **Core 0** | Background FreeRTOS task that fetches `components.json` and `incidents/unresolved.json` every 2 minutes, parses JSON, and writes results to a shared struct protected by a mutex |
+| **Core 1** | Arduino main loop — touch handling, UI rendering, matrix screensaver animation, and applying new data when available |
+
+This ensures the matrix screensaver runs at a smooth ~20fps with no stutter during HTTP requests, and the UI remains responsive at all times.
 
 ## Screensaver Behavior
 
